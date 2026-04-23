@@ -1738,13 +1738,13 @@ static bool fgOptimizeMaterializedBoolCompare(Compiler* compiler, BasicBlock* bl
     }
 
     GenTree* compareStore = nullptr;
+    // This fold is only sound for `cond || otherCompare`, where the entry
+    // BBJ_COND materializes 1 on its true edge. If the false edge materializes
+    // 1 instead, the relop pair alone is insufficient to recover the original
+    // edge orientation.
     if (trueStore->Data()->IsIntegralConst(1) && !falseStore->Data()->IsIntegralConst(1))
     {
         compareStore = falseStore->Data();
-    }
-    else if (falseStore->Data()->IsIntegralConst(1) && !trueStore->Data()->IsIntegralConst(1))
-    {
-        compareStore = trueStore->Data();
     }
     else
     {

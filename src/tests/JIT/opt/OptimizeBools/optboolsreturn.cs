@@ -255,6 +255,29 @@ public class CBoolTest
         }
         return b;
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool IsLessThanOrEqualZeroFalseEdgeOne(int x)
+    {
+        bool b = x > 0 ? x == 0 : true;
+        if (b)
+        {
+            OnTrue();
+        }
+        return b;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool IsGreaterThanOrEqualZeroFalseEdgeOne(int x)
+    {
+        bool b = x < 0 ? x == 0 : true;
+        if (b)
+        {
+            OnTrue();
+        }
+        return b;
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool AreBothGreatThanZero(int x, int y)
     {
@@ -977,6 +1000,24 @@ public class CBoolTest
             return 101;
         }
 
+        if (!IsGreaterThanOrEqualZeroFalseEdgeOne(10))
+        {
+            Console.WriteLine("CBoolTest:IsGreaterThanOrEqualZeroFalseEdgeOne(10) failed");
+            return 101;
+        }
+
+        if (!IsGreaterThanOrEqualZeroFalseEdgeOne(0))
+        {
+            Console.WriteLine("CBoolTest:IsGreaterThanOrEqualZeroFalseEdgeOne(0) failed");
+            return 101;
+        }
+
+        if (IsGreaterThanOrEqualZeroFalseEdgeOne(-10))
+        {
+            Console.WriteLine("CBoolTest:IsGreaterThanOrEqualZeroFalseEdgeOne(-10) failed");
+            return 101;
+        }
+
         if (!IsGreaterThanZero(10))
         {
             Console.WriteLine("CBoolTest:IsGreaterThanZero(10) failed");
@@ -1082,6 +1123,24 @@ public class CBoolTest
         if (!IsLessThanOrEqualZeroBisMinimal(-10))
         {
             Console.WriteLine("CBoolTest:IsLessThanOrEqualZeroBisMinimal(-10) failed");
+            return 101;
+        }
+
+        if (IsLessThanOrEqualZeroFalseEdgeOne(10))
+        {
+            Console.WriteLine("CBoolTest:IsLessThanOrEqualZeroFalseEdgeOne(10) failed");
+            return 101;
+        }
+
+        if (!IsLessThanOrEqualZeroFalseEdgeOne(0))
+        {
+            Console.WriteLine("CBoolTest:IsLessThanOrEqualZeroFalseEdgeOne(0) failed");
+            return 101;
+        }
+
+        if (!IsLessThanOrEqualZeroFalseEdgeOne(-10))
+        {
+            Console.WriteLine("CBoolTest:IsLessThanOrEqualZeroFalseEdgeOne(-10) failed");
             return 101;
         }
 
