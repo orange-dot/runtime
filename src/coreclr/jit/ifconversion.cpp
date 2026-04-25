@@ -54,6 +54,7 @@ private:
 
     GenTree* TryTransformSelectOperOrLocal(GenTree* oper, GenTree* lcl);
     GenTree* TryTransformSelectOperOrZero(GenTree* oper, GenTree* lcl);
+    GenTree* TryTransformSelectToGeLeCompare(GenTree* trueInput, GenTree* falseInput);
     GenTree* TryTransformSelectToOrdinaryOps(GenTree* trueInput, GenTree* falseInput);
 #ifdef DEBUG
     void IfConvertDump();
@@ -634,6 +635,66 @@ static IntConstSelectOper MatchIntConstSelectValues(int64_t trueVal, int64_t fal
     return {GT_NONE};
 }
 
+// Match signed compare(value, 0) and normalize operand order.
+static bool MatchSignedZeroCompare(GenTree* compare, genTreeOps* cmpOp, GenTree** value)
+{
+    if ((compare == nullptr) || !compare->OperIs(GT_EQ, GT_GT, GT_LT))
+        return false;
+
+    if ((compare->gtFlags & GTF_ALL_EFFECT) != 0)
+        return false;
+
+    GenTreeOp* compareOp = compare->AsOp();
+    if (compare->OperIs(GT_GT, GT_LT) && compareOp->IsUnsigned())
+        return false;
+
+    GenTree*   op1     = compareOp->gtOp1;
+    GenTree*   op2     = compareOp->gtOp2;
+    const bool op1Zero = op1->IsIntegralConst(0);
+    const bool op2Zero = op2->IsIntegralConst(0);
+    if (op1Zero == op2Zero)
+        return false;
+
+    *cmpOp = compare->OperGet();
+    *value = op1;
+    if (op1Zero)
+    {
+        *cmpOp = GenTree::SwapRelop(*cmpOp);
+        *value = op2;
+    }
+
+    return varTypeIsIntegralOrI(*value) && (((*value)->gtFlags & GTF_ALL_EFFECT) == 0);
+}
+
+// Match compare(value, 0) pairs that form value >= 0 or value <= 0.
+static genTreeOps MatchSignedZeroComparePair(GenTree* compare1, GenTree* compare2, GenTree** value)
+{
+    genTreeOps compare1Op;
+    GenTree*   compare1Value;
+    if (!MatchSignedZeroCompare(compare1, &compare1Op, &compare1Value))
+        return GT_NONE;
+
+    genTreeOps compare2Op;
+    GenTree*   compare2Value;
+    if (!MatchSignedZeroCompare(compare2, &compare2Op, &compare2Value))
+        return GT_NONE;
+
+    GenTree* effectiveValue1 = compare1Value->gtEffectiveVal();
+    GenTree* effectiveValue2 = compare2Value->gtEffectiveVal();
+    if (!GenTree::Compare(effectiveValue1, effectiveValue2))
+        return GT_NONE;
+
+    *value = compare1Value;
+
+    if (((compare1Op == GT_EQ) && (compare2Op == GT_GT)) || ((compare1Op == GT_GT) && (compare2Op == GT_EQ)))
+        return GT_GE;
+
+    if (((compare1Op == GT_EQ) && (compare2Op == GT_LT)) || ((compare1Op == GT_LT) && (compare2Op == GT_EQ)))
+        return GT_LE;
+
+    return GT_NONE;
+}
+
 //-----------------------------------------------------------------------------
 // TryTransformSelectOperOrLocal: Try to trasform "cond ? oper(lcl, (-)1) : lcl" into "oper(')(lcl, cond)"
 //
@@ -717,6 +778,37 @@ GenTree* OptIfConversionDsc::TryTransformSelectOperOrZero(GenTree* trueInput, Ge
     return nullptr;
 }
 
+// TryTransformSelectToGeLeCompare: Try to transform "compare(value, 0) ? 1 : compare(value, 0)"
+// to "value >= 0" or "value <= 0".
+//
+// Arguments:
+//     trueInput  - expression to be evaluated when m_cond is true, or null if there is no else expression
+//     falseInput - expression to be evaluated when m_cond is false
+//
+// Return Value:
+//     The transformed single expression equivalent to the if-else expressions, or null if no transformation took place
+//
+GenTree* OptIfConversionDsc::TryTransformSelectToGeLeCompare(GenTree* trueInput, GenTree* falseInput)
+{
+    if (trueInput == nullptr)
+        return nullptr;
+
+    if (!trueInput->IsIntegralConst(1))
+        return nullptr;
+
+    if (!trueInput->TypeIs(TYP_INT))
+        return nullptr;
+
+    GenTree*   value;
+    genTreeOps compareOp = MatchSignedZeroComparePair(m_cond, falseInput, &value);
+    if (compareOp == GT_NONE)
+        return nullptr;
+
+    GenTree* valueClone = m_compiler->gtCloneExpr(value);
+    GenTree* zero       = m_compiler->gtNewZeroConNode(valueClone->TypeGet());
+    return m_compiler->gtNewOperNode(compareOp, TYP_INT, valueClone, zero);
+}
+
 //-----------------------------------------------------------------------------
 // TryTransformSelectToOrdinaryOps: Try transforming the identified if-else expressions to a single expression
 //
@@ -780,8 +872,19 @@ GenTree* OptIfConversionDsc::TryTransformSelectToOrdinaryOps(GenTree* trueInput,
         }
 #endif // TARGET_RISCV64
     }
+
+    GenTree* transformed = TryTransformSelectToGeLeCompare(trueInput, falseInput);
+    if (transformed != nullptr)
+    {
+        return transformed;
+    }
+
 #ifdef TARGET_RISCV64
-    else
+    if ((trueInput != nullptr && trueInput->IsIntegralConst()) && falseInput->IsIntegralConst())
+    {
+        return nullptr;
+    }
+
     {
         if (trueInput == nullptr)
         {
@@ -789,7 +892,7 @@ GenTree* OptIfConversionDsc::TryTransformSelectToOrdinaryOps(GenTree* trueInput,
             trueInput = m_thenOperation.node;
         }
 
-        GenTree* transformed = TryTransformSelectOperOrLocal(trueInput, falseInput);
+        transformed = TryTransformSelectOperOrLocal(trueInput, falseInput);
         if (transformed != nullptr)
             return transformed;
 
