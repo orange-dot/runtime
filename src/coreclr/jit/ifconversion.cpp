@@ -54,6 +54,7 @@ private:
 
     GenTree* TryTransformSelectOperOrLocal(GenTree* oper, GenTree* lcl);
     GenTree* TryTransformSelectOperOrZero(GenTree* oper, GenTree* lcl);
+    GenTree* TryTransformSelectIntoSignedZeroCompare(GenTree* falseInput);
     GenTree* TryTransformSelectToOrdinaryOps(GenTree* trueInput, GenTree* falseInput);
 #ifdef DEBUG
     void IfConvertDump();
@@ -635,6 +636,61 @@ static IntConstSelectOper MatchIntConstSelectValues(int64_t trueVal, int64_t fal
 }
 
 //-----------------------------------------------------------------------------
+// MatchSignedZeroCompare: Match a side-effect-free signed integer compare against zero,
+// returning the value side and the comparison operator in normalized form.
+//
+// Recognizes the shapes:
+//     value <op> 0   -> returned as (value, <op>)
+//     0 <op> value   -> returned as (value, swapped(<op>))
+//
+// Rejects unsigned comparisons and any value subtree carrying side effects, so the
+// caller can safely clone the returned value to build a new tree.
+//
+// Arguments:
+//     compare            - candidate compare tree
+//     outValue           - on success, the non-zero side of the compare
+//     outNormalizedOper  - on success, the operator written as `value <op> 0`
+//
+// Return Value:
+//     true if `compare` is a side-effect-free signed integer compare against zero.
+//
+static bool MatchSignedZeroCompare(GenTree* compare, GenTree** outValue, genTreeOps* outNormalizedOper)
+{
+    if ((compare == nullptr) || !compare->OperIsCompare() || compare->IsUnsigned())
+    {
+        return false;
+    }
+
+    GenTree*   op1  = compare->gtGetOp1();
+    GenTree*   op2  = compare->gtGetOp2();
+    genTreeOps oper = compare->OperGet();
+
+    GenTree* value;
+    if (op2->IsIntegralConst(0))
+    {
+        value = op1;
+    }
+    else if (op1->IsIntegralConst(0))
+    {
+        value = op2;
+        oper  = GenTree::SwapRelop(oper);
+    }
+    else
+    {
+        return false;
+    }
+
+    if (!varTypeIsIntegral(value) || ((value->gtFlags & GTF_SIDE_EFFECT) != 0))
+    {
+        return false;
+    }
+
+    *outValue          = value;
+    *outNormalizedOper = oper;
+    return true;
+}
+
+//-----------------------------------------------------------------------------
 // TryTransformSelectOperOrLocal: Try to trasform "cond ? oper(lcl, (-)1) : lcl" into "oper(')(lcl, cond)"
 //
 // Arguments:
@@ -718,6 +774,72 @@ GenTree* OptIfConversionDsc::TryTransformSelectOperOrZero(GenTree* trueInput, Ge
 }
 
 //-----------------------------------------------------------------------------
+// TryTransformSelectIntoSignedZeroCompare: Fold a SELECT whose true input is the integer
+// literal `1` and whose false input is a signed zero compare matching `m_cond`'s zero
+// compare on the same value into a single GT_GE / GT_LE compare.
+//
+// Recognizes the materialized-bool short-circuit shape:
+//     SELECT(EQ(x, 0), 1, GT(x, 0))    -> GE(x, 0)
+//     SELECT(GT(x, 0), 1, EQ(x, 0))    -> GE(x, 0)
+//     SELECT(EQ(x, 0), 1, LT(x, 0))    -> LE(x, 0)
+//     SELECT(LT(x, 0), 1, EQ(x, 0))    -> LE(x, 0)
+//
+// The compare pair is treated as unordered. Both compares must be signed integer compares
+// against zero on the same side-effect-free value (compared structurally with
+// `GenTree::Compare` after `gtEffectiveVal`).
+//
+// Arguments:
+//     falseInput  - the false-arm subtree from the parent SELECT
+//
+// Return Value:
+//     A new GT_GE / GT_LE compare tree on success; nullptr otherwise.
+//
+GenTree* OptIfConversionDsc::TryTransformSelectIntoSignedZeroCompare(GenTree* falseInput)
+{
+    GenTree*   condValue;
+    genTreeOps condOper;
+    if (!MatchSignedZeroCompare(m_cond, &condValue, &condOper))
+    {
+        return nullptr;
+    }
+
+    GenTree*   falseValue;
+    genTreeOps falseOper;
+    if (!MatchSignedZeroCompare(falseInput, &falseValue, &falseOper))
+    {
+        return nullptr;
+    }
+
+    if (!GenTree::Compare(condValue->gtEffectiveVal(), falseValue->gtEffectiveVal()))
+    {
+        return nullptr;
+    }
+
+    // Map the unordered pair (condOper, falseOper) to the result compare.
+    genTreeOps resultOper;
+    if (((condOper == GT_EQ) && (falseOper == GT_GT)) || ((condOper == GT_GT) && (falseOper == GT_EQ)))
+    {
+        resultOper = GT_GE;
+    }
+    else if (((condOper == GT_EQ) && (falseOper == GT_LT)) || ((condOper == GT_LT) && (falseOper == GT_EQ)))
+    {
+        resultOper = GT_LE;
+    }
+    else
+    {
+        return nullptr;
+    }
+
+    // Both source compares become dead. Clone the value once for the new compare so the
+    // result tree is not aliased with the soon-to-be-discarded `m_cond` / `falseInput` subtrees.
+    GenTree* clonedValue = m_compiler->gtCloneExpr(condValue);
+    GenTree* zeroNode    = m_compiler->gtNewZeroConNode(genActualType(condValue));
+    GenTree* result      = m_compiler->gtNewOperNode(resultOper, TYP_INT, clonedValue, zeroNode);
+    result->AddAllEffectsFlags(clonedValue);
+    return result;
+}
+
+//-----------------------------------------------------------------------------
 // TryTransformSelectToOrdinaryOps: Try transforming the identified if-else expressions to a single expression
 //
 // This is meant mostly for RISC-V where the condition (1 or 0) is stored in a regular general-purpose register
@@ -780,9 +902,22 @@ GenTree* OptIfConversionDsc::TryTransformSelectToOrdinaryOps(GenTree* trueInput,
         }
 #endif // TARGET_RISCV64
     }
-#ifdef TARGET_RISCV64
     else
     {
+        // Cross-target fold: SELECT(cond, 1, falseInput) where both `cond` and
+        // `falseInput` are signed zero compares on the same value collapses to a
+        // single GT_GE / GT_LE compare. Handles the materialized-bool short-circuit
+        // pattern `x == 0 || x > 0` and its sibling forms.
+        if ((trueInput != nullptr) && trueInput->IsIntegralConst(1) && trueInput->TypeIs(TYP_INT))
+        {
+            GenTree* folded = TryTransformSelectIntoSignedZeroCompare(falseInput);
+            if (folded != nullptr)
+            {
+                return folded;
+            }
+        }
+
+#ifdef TARGET_RISCV64
         if (trueInput == nullptr)
         {
             assert(m_mainOper == GT_STORE_LCL_VAR && !m_doElseConversion);
@@ -796,8 +931,8 @@ GenTree* OptIfConversionDsc::TryTransformSelectToOrdinaryOps(GenTree* trueInput,
         transformed = TryTransformSelectOperOrZero(trueInput, falseInput);
         if (transformed != nullptr)
             return transformed;
-    }
 #endif // TARGET_RISCV64
+    }
     return nullptr;
 }
 
