@@ -54,6 +54,7 @@ private:
 
     GenTree* TryTransformSelectOperOrLocal(GenTree* oper, GenTree* lcl);
     GenTree* TryTransformSelectOperOrZero(GenTree* oper, GenTree* lcl);
+    GenTree* TryTransformSelectIntoSignedZeroCompare(GenTree* trueInput, GenTree* falseInput);
     GenTree* TryTransformSelectToOrdinaryOps(GenTree* trueInput, GenTree* falseInput);
 #ifdef DEBUG
     void IfConvertDump();
@@ -635,6 +636,90 @@ static IntConstSelectOper MatchIntConstSelectValues(int64_t trueVal, int64_t fal
 }
 
 //-----------------------------------------------------------------------------
+// MatchSignedZeroCompare: Match a side-effect-free signed integer compare against zero.
+//
+// Recognizes:
+//     value <op> 0
+//     0 <op> value
+//
+// Arguments:
+//     compare - candidate compare tree
+//     cmpOp   - [out] compare operator normalized as "value <op> 0"
+//     value   - [out] non-zero operand
+//
+// Return Value:
+//     True if compare is a signed EQ/GT/LT zero compare on an effect-free integer value.
+//
+static bool MatchSignedZeroCompare(GenTree* compare, genTreeOps* cmpOp, GenTree** value)
+{
+    if ((compare == nullptr) || !compare->OperIs(GT_EQ, GT_GT, GT_LT))
+        return false;
+
+    if ((compare->gtFlags & GTF_ALL_EFFECT) != 0)
+        return false;
+
+    GenTreeOp* compareOp = compare->AsOp();
+    if (compare->OperIs(GT_GT, GT_LT) && compareOp->IsUnsigned())
+        return false;
+
+    GenTree*   op1     = compareOp->gtOp1;
+    GenTree*   op2     = compareOp->gtOp2;
+    const bool op1Zero = op1->IsIntegralConst(0);
+    const bool op2Zero = op2->IsIntegralConst(0);
+    if (op1Zero == op2Zero)
+        return false;
+
+    *cmpOp = compare->OperGet();
+    *value = op1;
+    if (op1Zero)
+    {
+        *cmpOp = GenTree::SwapRelop(*cmpOp);
+        *value = op2;
+    }
+
+    return varTypeIsIntegralOrI(*value) && (((*value)->gtFlags & GTF_ALL_EFFECT) == 0);
+}
+
+//-----------------------------------------------------------------------------
+// MatchSignedZeroComparePair: Match zero-compare pairs that form value >= 0 or value <= 0.
+//
+// Arguments:
+//     compare1 - first compare tree
+//     compare2 - second compare tree
+//     value    - [out] compared value
+//
+// Return Value:
+//     GT_GE, GT_LE, or GT_NONE if the pair does not match.
+//
+static genTreeOps MatchSignedZeroComparePair(GenTree* compare1, GenTree* compare2, GenTree** value)
+{
+    genTreeOps compare1Op;
+    GenTree*   compare1Value;
+    if (!MatchSignedZeroCompare(compare1, &compare1Op, &compare1Value))
+        return GT_NONE;
+
+    genTreeOps compare2Op;
+    GenTree*   compare2Value;
+    if (!MatchSignedZeroCompare(compare2, &compare2Op, &compare2Value))
+        return GT_NONE;
+
+    GenTree* effectiveValue1 = compare1Value->gtEffectiveVal();
+    GenTree* effectiveValue2 = compare2Value->gtEffectiveVal();
+    if (!GenTree::Compare(effectiveValue1, effectiveValue2))
+        return GT_NONE;
+
+    *value = compare1Value;
+
+    if (((compare1Op == GT_EQ) && (compare2Op == GT_GT)) || ((compare1Op == GT_GT) && (compare2Op == GT_EQ)))
+        return GT_GE;
+
+    if (((compare1Op == GT_EQ) && (compare2Op == GT_LT)) || ((compare1Op == GT_LT) && (compare2Op == GT_EQ)))
+        return GT_LE;
+
+    return GT_NONE;
+}
+
+//-----------------------------------------------------------------------------
 // TryTransformSelectOperOrLocal: Try to trasform "cond ? oper(lcl, (-)1) : lcl" into "oper(')(lcl, cond)"
 //
 // Arguments:
@@ -718,6 +803,43 @@ GenTree* OptIfConversionDsc::TryTransformSelectOperOrZero(GenTree* trueInput, Ge
 }
 
 //-----------------------------------------------------------------------------
+// TryTransformSelectIntoSignedZeroCompare: Fold SELECT(cond, 1, falseInput) into a signed zero compare.
+//
+// Recognizes:
+//     SELECT(EQ(x, 0), 1, GT(x, 0)) -> GE(x, 0)
+//     SELECT(GT(x, 0), 1, EQ(x, 0)) -> GE(x, 0)
+//     SELECT(EQ(x, 0), 1, LT(x, 0)) -> LE(x, 0)
+//     SELECT(LT(x, 0), 1, EQ(x, 0)) -> LE(x, 0)
+//
+// Arguments:
+//     trueInput  - expression to be evaluated when m_cond is true, or null if there is no else expression
+//     falseInput - expression to be evaluated when m_cond is false
+//
+// Return Value:
+//     The transformed single expression equivalent to the if-else expressions, or null if no transformation took place
+//
+GenTree* OptIfConversionDsc::TryTransformSelectIntoSignedZeroCompare(GenTree* trueInput, GenTree* falseInput)
+{
+    if (trueInput == nullptr)
+        return nullptr;
+
+    if (!trueInput->IsIntegralConst(1))
+        return nullptr;
+
+    if (!trueInput->TypeIs(TYP_INT))
+        return nullptr;
+
+    GenTree*   value;
+    genTreeOps compareOp = MatchSignedZeroComparePair(m_cond, falseInput, &value);
+    if (compareOp == GT_NONE)
+        return nullptr;
+
+    GenTree* valueClone = m_compiler->gtCloneExpr(value);
+    GenTree* zero       = m_compiler->gtNewZeroConNode(valueClone->TypeGet());
+    return m_compiler->gtNewOperNode(compareOp, TYP_INT, valueClone, zero);
+}
+
+//-----------------------------------------------------------------------------
 // TryTransformSelectToOrdinaryOps: Try transforming the identified if-else expressions to a single expression
 //
 // This is meant mostly for RISC-V where the condition (1 or 0) is stored in a regular general-purpose register
@@ -780,24 +902,31 @@ GenTree* OptIfConversionDsc::TryTransformSelectToOrdinaryOps(GenTree* trueInput,
         }
 #endif // TARGET_RISCV64
     }
-#ifdef TARGET_RISCV64
     else
     {
+        GenTree* transformed = TryTransformSelectIntoSignedZeroCompare(trueInput, falseInput);
+        if (transformed != nullptr)
+        {
+            return transformed;
+        }
+
+#ifdef TARGET_RISCV64
         if (trueInput == nullptr)
         {
             assert(m_mainOper == GT_STORE_LCL_VAR && !m_doElseConversion);
             trueInput = m_thenOperation.node;
         }
 
-        GenTree* transformed = TryTransformSelectOperOrLocal(trueInput, falseInput);
+        transformed = TryTransformSelectOperOrLocal(trueInput, falseInput);
         if (transformed != nullptr)
             return transformed;
 
         transformed = TryTransformSelectOperOrZero(trueInput, falseInput);
         if (transformed != nullptr)
             return transformed;
-    }
 #endif // TARGET_RISCV64
+    }
+
     return nullptr;
 }
 
